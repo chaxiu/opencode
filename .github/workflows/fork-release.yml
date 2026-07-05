@@ -1,0 +1,272 @@
+name: fork-release
+
+on:
+  workflow_dispatch:
+    inputs:
+      version:
+        description: "Release version, with or without leading v"
+        required: true
+        type: string
+      ref:
+        description: "Git ref to tag if the release tag does not already exist"
+        required: false
+        default: "dev"
+        type: string
+      build_cli:
+        description: "Build and upload opencode CLI binaries"
+        required: true
+        default: true
+        type: boolean
+      build_desktop:
+        description: "Build and upload desktop binaries"
+        required: true
+        default: true
+        type: boolean
+
+concurrency:
+  group: fork-release-${{ inputs.version }}
+  cancel-in-progress: false
+
+permissions:
+  contents: write
+
+env:
+  OPENCODE_CHANNEL: prod
+  OPENCODE_DESKTOP_APP_ID: sh.munk.opencode
+  OPENCODE_DESKTOP_SIGN: "false"
+  OPENCODE_DESKTOP_NOTARIZE: "false"
+
+jobs:
+  prepare-release:
+    runs-on: ubuntu-latest
+    outputs:
+      tag: ${{ steps.meta.outputs.tag }}
+      version: ${{ steps.meta.outputs.version }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+          ref: ${{ inputs.ref }}
+
+      - name: Normalize version
+        id: meta
+        shell: bash
+        run: |
+          version="${{ inputs.version }}"
+          version="${version#v}"
+          tag="v${version}"
+          echo "version=${version}" >> "$GITHUB_OUTPUT"
+          echo "tag=${tag}" >> "$GITHUB_OUTPUT"
+
+      - name: Ensure tag exists on origin
+        shell: bash
+        run: |
+          tag="${{ steps.meta.outputs.tag }}"
+          if git rev-parse -q --verify "refs/tags/${tag}" >/dev/null; then
+            echo "Tag ${tag} already exists locally"
+          else
+            git tag "${tag}" "${GITHUB_SHA}"
+          fi
+
+          if git ls-remote --exit-code --tags origin "refs/tags/${tag}" >/dev/null 2>&1; then
+            echo "Tag ${tag} already exists on origin"
+          else
+            git push origin "refs/tags/${tag}"
+          fi
+
+      - name: Ensure GitHub release exists
+        env:
+          GH_TOKEN: ${{ github.token }}
+        shell: bash
+        run: |
+          tag="${{ steps.meta.outputs.tag }}"
+          notes_file="$(mktemp)"
+          cat > "${notes_file}" <<EOF
+          Fork release ${tag}.
+
+          Included artifacts:
+          - CLI binaries for macOS, Linux, and Windows
+          - Desktop binaries for macOS, Linux, and Windows
+
+          All assets in this release are unsigned and not notarized.
+          EOF
+
+          if gh release view "${tag}" >/dev/null 2>&1; then
+            gh release edit "${tag}" \
+              --title "${tag}" \
+              --notes-file "${notes_file}"
+          else
+            gh release create "${tag}" \
+              --title "${tag}" \
+              --notes-file "${notes_file}" \
+              --verify-tag
+          fi
+
+  build-cli:
+    needs: prepare-release
+    if: ${{ inputs.build_cli }}
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ needs.prepare-release.outputs.tag }}
+
+      - uses: ./.github/actions/setup-bun
+
+      - name: Build CLI binaries
+        working-directory: packages/opencode
+        env:
+          OPENCODE_VERSION: ${{ needs.prepare-release.outputs.version }}
+        run: ./script/build.ts
+
+      - name: Archive CLI binaries
+        working-directory: packages/opencode
+        shell: bash
+        run: |
+          shopt -s nullglob
+          for dir in dist/*; do
+            [ -d "${dir}/bin" ] || continue
+            name="$(basename "${dir}")"
+            if [[ "${name}" == *linux* ]]; then
+              tar -C "${dir}/bin" -czf "dist/${name}.tar.gz" .
+            else
+              (
+                cd "${dir}/bin"
+                zip -qr "../../${name}.zip" .
+              )
+            fi
+          done
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: cli-release-assets
+          path: |
+            packages/opencode/dist/*.zip
+            packages/opencode/dist/*.tar.gz
+          if-no-files-found: error
+
+  build-desktop:
+    needs: prepare-release
+    if: ${{ inputs.build_desktop }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - name: macos-x64
+            os: macos-13
+            platform_flag: --mac --x64
+            rust_target: x86_64-apple-darwin
+            bun_install_flags: --os=darwin --cpu=x64
+          - name: macos-arm64
+            os: macos-14
+            platform_flag: --mac --arm64
+            rust_target: aarch64-apple-darwin
+            bun_install_flags: --os=darwin --cpu=arm64
+          - name: linux-x64
+            os: ubuntu-24.04
+            platform_flag: --linux
+            rust_target: x86_64-unknown-linux-gnu
+            bun_install_flags: ""
+          - name: windows-x64
+            os: windows-latest
+            platform_flag: --win
+            rust_target: x86_64-pc-windows-msvc
+            bun_install_flags: ""
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ needs.prepare-release.outputs.tag }}
+
+      - uses: ./.github/actions/setup-bun
+        with:
+          install-flags: ${{ matrix.bun_install_flags }}
+
+      - name: Install Linux packaging dependencies
+        if: runner.os == 'Linux'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends rpm
+
+      - name: Build desktop app
+        working-directory: packages/desktop
+        env:
+          OPENCODE_VERSION: ${{ needs.prepare-release.outputs.version }}
+          RUST_TARGET: ${{ matrix.rust_target }}
+        run: |
+          bun ./scripts/prepare.ts
+          bun run build
+          npx electron-builder ${{ matrix.platform_flag }} --publish never --config electron-builder.config.ts
+
+      - name: Package macOS app bundle
+        if: runner.os == 'macOS'
+        working-directory: packages/desktop/dist
+        shell: bash
+        run: |
+          if [[ "${{ matrix.rust_target }}" == "x86_64-apple-darwin" ]]; then
+            app_dir="mac"
+            out_name="opencode-desktop-mac-x64.app.tar.gz"
+          else
+            app_dir="mac-arm64"
+            out_name="opencode-desktop-mac-arm64.app.tar.gz"
+          fi
+          app_path="$(find "${app_dir}" -maxdepth 1 -name '*.app' -type d | head -1)"
+          if [[ -z "${app_path}" ]]; then
+            echo "No .app bundle found in ${app_dir}"
+            exit 1
+          fi
+          tar -czf "${out_name}" -C "$(dirname "${app_path}")" "$(basename "${app_path}")"
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: desktop-release-assets-${{ matrix.name }}
+          path: |
+            packages/desktop/dist/*.dmg
+            packages/desktop/dist/*.zip
+            packages/desktop/dist/*.app.tar.gz
+            packages/desktop/dist/*.exe
+            packages/desktop/dist/*.blockmap
+            packages/desktop/dist/*.AppImage
+            packages/desktop/dist/*.deb
+            packages/desktop/dist/*.rpm
+          if-no-files-found: error
+
+  publish-assets:
+    needs:
+      - prepare-release
+      - build-cli
+      - build-desktop
+    if: >-
+      ${{
+        always() &&
+        needs.prepare-release.result == 'success' &&
+        (needs.build_cli.result == 'success' || needs.build_cli.result == 'skipped') &&
+        (needs.build_desktop.result == 'success' || needs.build_desktop.result == 'skipped')
+      }}
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/download-artifact@v4
+        if: ${{ inputs.build_cli }}
+        with:
+          name: cli-release-assets
+          path: release-assets
+
+      - uses: actions/download-artifact@v4
+        if: ${{ inputs.build_desktop }}
+        with:
+          pattern: desktop-release-assets-*
+          path: release-assets
+          merge-multiple: true
+
+      - name: Upload assets to GitHub release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        shell: bash
+        run: |
+          shopt -s nullglob
+          files=(release-assets/*)
+          if (( ${#files[@]} == 0 )); then
+            echo "No release assets found"
+            exit 1
+          fi
+          gh release upload "${{ needs.prepare-release.outputs.tag }}" "${files[@]}" --clobber

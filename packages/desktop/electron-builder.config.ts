@@ -38,6 +38,12 @@ const APP_IDS = {
   prod: "ai.opencode.desktop",
 } as const
 
+const envAppId = process.env.OPENCODE_DESKTOP_APP_ID?.trim()
+const envDesktopSign = process.env.OPENCODE_DESKTOP_SIGN?.trim().toLowerCase()
+const envDesktopNotarize = process.env.OPENCODE_DESKTOP_NOTARIZE?.trim().toLowerCase()
+const shouldSignDesktop = envDesktopSign !== "false"
+const shouldNotarizeDesktop = shouldSignDesktop && envDesktopNotarize !== "false"
+
 const getBase = (appId: string): Configuration => ({
   artifactName: "opencode-desktop-${os}-${arch}.${ext}",
   directories: {
@@ -63,15 +69,15 @@ const getBase = (appId: string): Configuration => ({
   mac: {
     category: "public.app-category.developer-tools",
     icon: `resources/icons/icon.icns`,
-    hardenedRuntime: true,
+    hardenedRuntime: shouldSignDesktop,
     gatekeeperAssess: false,
     entitlements: "resources/entitlements.plist",
     entitlementsInherit: "resources/entitlements.plist",
-    notarize: true,
+    notarize: shouldNotarizeDesktop,
     target: ["dmg", "zip"],
   },
   dmg: {
-    sign: true,
+    sign: shouldSignDesktop,
   },
   protocols: {
     name: "OpenCode",
@@ -107,7 +113,7 @@ const getBase = (appId: string): Configuration => ({
 })
 
 function getConfig() {
-  const appId = APP_IDS[channel]
+  const appId = envAppId || APP_IDS[channel]
   const base = getBase(appId)
 
   switch (channel) {
