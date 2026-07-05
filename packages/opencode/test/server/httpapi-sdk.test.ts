@@ -771,6 +771,41 @@ describe("HttpApi SDK", () => {
     ),
   )
 
+  serverPathParity("lists structured-output user messages through v1 session.messages", (serverPath) =>
+    withStandardProject(serverPath, ({ sdk }) =>
+      Effect.gen(function* () {
+        const session = yield* capture(() => sdk.session.create({ title: "structured-output-v1-messages" }))
+        const sessionID = String(record(session.data).id)
+        const promptAsync = yield* capture(() =>
+          sdk.session.promptAsync({
+            sessionID,
+            noReply: true,
+            parts: [{ type: "text", text: "return structured output" }],
+            format: {
+              type: "json_schema",
+              schema: {
+                type: "object",
+                additionalProperties: false,
+                properties: {
+                  ok: { type: "boolean" },
+                },
+                required: ["ok"],
+              },
+              retryCount: 2,
+            },
+          }),
+        )
+        const messages = yield* capture(() => sdk.session.messages({ sessionID }))
+
+        return {
+          statuses: statuses({ session, promptAsync, messages }),
+          messageCount: array(messages.data).length,
+          userFormat: record(record(array(messages.data)[0]).info).format,
+        }
+      }),
+    ),
+  )
+
   serverPathParity("matches generated SDK prompt streaming through fake LLM", (serverPath) =>
     withFakeLlm(serverPath, ({ sdk, llm }) =>
       Effect.gen(function* () {
