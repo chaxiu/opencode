@@ -12,16 +12,6 @@ on:
         required: false
         default: "dev"
         type: string
-      build_cli:
-        description: "Build and upload opencode CLI binaries"
-        required: true
-        default: true
-        type: boolean
-      build_desktop:
-        description: "Build and upload desktop binaries"
-        required: true
-        default: true
-        type: boolean
 
 concurrency:
   group: fork-release-${{ inputs.version }}
@@ -32,9 +22,6 @@ permissions:
 
 env:
   OPENCODE_CHANNEL: prod
-  OPENCODE_DESKTOP_APP_ID: sh.munk.opencode
-  OPENCODE_DESKTOP_SIGN: "false"
-  OPENCODE_DESKTOP_NOTARIZE: "false"
 
 jobs:
   prepare-release:
@@ -86,9 +73,8 @@ jobs:
 
           Included artifacts:
           - CLI binaries for macOS, Linux, and Windows
-          - Desktop binaries for macOS, Linux, and Windows
 
-          All assets in this release are unsigned and not notarized.
+          All assets in this release are unsigned.
           EOF
 
           if gh release view "${tag}" >/dev/null 2>&1; then
@@ -104,8 +90,31 @@ jobs:
 
   build-cli:
     needs: prepare-release
-    if: ${{ inputs.build_cli }}
-    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - name: macos-arm64
+            os: macos-14
+            build_args: --single
+            dist_name: opencode-darwin-arm64
+            archive_name: opencode-darwin-arm64.zip
+          - name: macos-x64
+            os: macos-13
+            build_args: --single --baseline
+            dist_name: opencode-darwin-x64-baseline
+            archive_name: opencode-darwin-x64-baseline.zip
+          - name: linux-x64
+            os: ubuntu-24.04
+            build_args: --single --baseline
+            dist_name: opencode-linux-x64-baseline
+            archive_name: opencode-linux-x64-baseline.tar.gz
+          - name: windows-x64
+            os: windows-latest
+            build_args: --single --baseline
+            dist_name: opencode-windows-x64-baseline
+            archive_name: opencode-windows-x64-baseline.zip
+    runs-on: ${{ matrix.os }}
     steps:
       - uses: actions/checkout@v4
         with:
@@ -117,144 +126,50 @@ jobs:
         working-directory: packages/opencode
         env:
           OPENCODE_VERSION: ${{ needs.prepare-release.outputs.version }}
-        run: ./script/build.ts
+        run: ./script/build.ts ${{ matrix.build_args }}
 
-      - name: Archive CLI binaries
+      - name: Archive CLI binaries (Unix)
+        if: runner.os != 'Windows'
         working-directory: packages/opencode
         shell: bash
         run: |
-          shopt -s nullglob
-          for dir in dist/*; do
-            [ -d "${dir}/bin" ] || continue
-            name="$(basename "${dir}")"
-            if [[ "${name}" == *linux* ]]; then
-              tar -C "${dir}/bin" -czf "dist/${name}.tar.gz" .
-            else
-              (
-                cd "${dir}/bin"
-                zip -qr "../../${name}.zip" .
-              )
-            fi
-          done
-
-      - uses: actions/upload-artifact@v4
-        with:
-          name: cli-release-assets
-          path: |
-            packages/opencode/dist/*.zip
-            packages/opencode/dist/*.tar.gz
-          if-no-files-found: error
-
-  build-desktop:
-    needs: prepare-release
-    if: ${{ inputs.build_desktop }}
-    strategy:
-      fail-fast: false
-      matrix:
-        include:
-          - name: macos-x64
-            os: macos-13
-            platform_flag: --mac --x64
-            rust_target: x86_64-apple-darwin
-            bun_install_flags: --os=darwin --cpu=x64
-          - name: macos-arm64
-            os: macos-14
-            platform_flag: --mac --arm64
-            rust_target: aarch64-apple-darwin
-            bun_install_flags: --os=darwin --cpu=arm64
-          - name: linux-x64
-            os: ubuntu-24.04
-            platform_flag: --linux
-            rust_target: x86_64-unknown-linux-gnu
-            bun_install_flags: ""
-          - name: windows-x64
-            os: windows-latest
-            platform_flag: --win
-            rust_target: x86_64-pc-windows-msvc
-            bun_install_flags: ""
-    runs-on: ${{ matrix.os }}
-    steps:
-      - uses: actions/checkout@v4
-        with:
-          ref: ${{ needs.prepare-release.outputs.tag }}
-
-      - uses: ./.github/actions/setup-bun
-        with:
-          install-flags: ${{ matrix.bun_install_flags }}
-
-      - name: Install Linux packaging dependencies
-        if: runner.os == 'Linux'
-        run: |
-          sudo apt-get update
-          sudo apt-get install -y --no-install-recommends rpm
-
-      - name: Build desktop app
-        working-directory: packages/desktop
-        env:
-          OPENCODE_VERSION: ${{ needs.prepare-release.outputs.version }}
-          RUST_TARGET: ${{ matrix.rust_target }}
-        run: |
-          bun ./scripts/prepare.ts
-          bun run build
-          npx electron-builder ${{ matrix.platform_flag }} --publish never --config electron-builder.config.ts
-
-      - name: Package macOS app bundle
-        if: runner.os == 'macOS'
-        working-directory: packages/desktop/dist
-        shell: bash
-        run: |
-          if [[ "${{ matrix.rust_target }}" == "x86_64-apple-darwin" ]]; then
-            app_dir="mac"
-            out_name="opencode-desktop-mac-x64.app.tar.gz"
+          if [[ "${{ matrix.archive_name }}" == *.tar.gz ]]; then
+            tar -C "dist/${{ matrix.dist_name }}/bin" -czf "dist/${{ matrix.archive_name }}" .
           else
-            app_dir="mac-arm64"
-            out_name="opencode-desktop-mac-arm64.app.tar.gz"
+            (
+              cd "dist/${{ matrix.dist_name }}/bin"
+              zip -qr "../../${{ matrix.archive_name }}" .
+            )
           fi
-          app_path="$(find "${app_dir}" -maxdepth 1 -name '*.app' -type d | head -1)"
-          if [[ -z "${app_path}" ]]; then
-            echo "No .app bundle found in ${app_dir}"
-            exit 1
-          fi
-          tar -czf "${out_name}" -C "$(dirname "${app_path}")" "$(basename "${app_path}")"
+
+      - name: Archive CLI binaries (Windows)
+        if: runner.os == 'Windows'
+        working-directory: packages/opencode
+        shell: pwsh
+        run: |
+          Compress-Archive -Path "dist/${{ matrix.dist_name }}/bin/*" -DestinationPath "dist/${{ matrix.archive_name }}" -Force
 
       - uses: actions/upload-artifact@v4
         with:
-          name: desktop-release-assets-${{ matrix.name }}
-          path: |
-            packages/desktop/dist/*.dmg
-            packages/desktop/dist/*.zip
-            packages/desktop/dist/*.app.tar.gz
-            packages/desktop/dist/*.exe
-            packages/desktop/dist/*.blockmap
-            packages/desktop/dist/*.AppImage
-            packages/desktop/dist/*.deb
-            packages/desktop/dist/*.rpm
+          name: cli-release-assets-${{ matrix.name }}
+          path: packages/opencode/dist/${{ matrix.archive_name }}
           if-no-files-found: error
 
   publish-assets:
     needs:
       - prepare-release
       - build-cli
-      - build-desktop
     if: >-
       ${{
         always() &&
         needs.prepare-release.result == 'success' &&
-        (needs.build_cli.result == 'success' || needs.build_cli.result == 'skipped') &&
-        (needs.build_desktop.result == 'success' || needs.build_desktop.result == 'skipped')
+        needs.build_cli.result == 'success'
       }}
     runs-on: ubuntu-latest
     steps:
       - uses: actions/download-artifact@v4
-        if: ${{ inputs.build_cli }}
         with:
-          name: cli-release-assets
-          path: release-assets
-
-      - uses: actions/download-artifact@v4
-        if: ${{ inputs.build_desktop }}
-        with:
-          pattern: desktop-release-assets-*
+          pattern: cli-release-assets-*
           path: release-assets
           merge-multiple: true
 
