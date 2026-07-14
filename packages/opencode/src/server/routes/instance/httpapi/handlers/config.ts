@@ -1,15 +1,16 @@
 import { Config } from "@/config/config"
 import { Provider } from "@/provider/provider"
-import * as InstanceState from "@/effect/instance-state"
 import { Effect } from "effect"
 import { HttpApiBuilder } from "effect/unstable/httpapi"
 import { InstanceHttpApi } from "../api"
-import { markInstanceForDisposal } from "../lifecycle"
+import { disposeAllInstancesAndEmitGlobalDisposed } from "@/server/global-lifecycle"
+import { EffectBridge } from "@/effect/bridge"
 
 export const configHandlers = HttpApiBuilder.group(InstanceHttpApi, "config", (handlers) =>
   Effect.gen(function* () {
     const providerSvc = yield* Provider.Service
     const configSvc = yield* Config.Service
+    const bridge = yield* EffectBridge.make()
 
     const get = Effect.fn("ConfigHttpApi.get")(function* () {
       return yield* configSvc.get()
@@ -17,7 +18,9 @@ export const configHandlers = HttpApiBuilder.group(InstanceHttpApi, "config", (h
 
     const update = Effect.fn("ConfigHttpApi.update")(function* (ctx) {
       yield* configSvc.update(ctx.payload)
-      yield* markInstanceForDisposal(yield* InstanceState.context)
+      // Provider models are cached per instance at boot; dispose all so every
+      // directory reloads config (including CONFIG_DIR / runtimeOverrides).
+      bridge.fork(disposeAllInstancesAndEmitGlobalDisposed({ swallowErrors: true }))
       return ctx.payload
     })
 

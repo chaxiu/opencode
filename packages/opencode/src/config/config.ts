@@ -50,6 +50,10 @@ function mergeConfigConcatArrays(target: Info, source: Info): Info {
   return merged
 }
 
+// Process-level overrides from PATCH /config. Applied after OPENCODE_CONFIG_CONTENT so
+// runtime updates stay effective even when CONTENT is set. Cleared on Config.invalidate.
+let runtimeOverrides: Info = {}
+
 function normalizeLoadedConfig(data: unknown) {
   if (!isRecord(data)) return data
   const copy = { ...data }
@@ -406,6 +410,9 @@ const layer = Layer.effect(
           for (const file of yield* ConfigPaths.files("opencode", ctx.directory, ctx.worktree).pipe(Effect.orDie)) {
             yield* merge(file, yield* loadFile(file, authEnv), "local")
           }
+          // Config.update writes <directory>/config.json; load it so PATCH survives instance reload.
+          const projectConfigJson = path.join(ctx.directory, "config.json")
+          yield* merge(projectConfigJson, yield* loadFile(projectConfigJson, authEnv), "local")
         }
 
         result.agent = result.agent || {}
@@ -472,6 +479,11 @@ const layer = Layer.effect(
           })
           yield* merge(source, next, "local")
           yield* Effect.logDebug("loaded custom config from OPENCODE_CONFIG_CONTENT")
+        }
+
+        // Runtime overrides from Config.update / PATCH /config outrank CONTENT for the process lifetime.
+        if (Object.keys(runtimeOverrides).length > 0) {
+          yield* merge("runtimeOverrides", runtimeOverrides, "local")
         }
 
         const activeAccount = Option.getOrUndefined(
@@ -624,12 +636,13 @@ const layer = Layer.effect(
       const dir = yield* InstanceState.directory
       const file = path.join(dir, "config.json")
       const existing = yield* loadFile(file)
-      yield* fs
-        .writeFileString(file, JSON.stringify(mergeDeep(writable(existing), writable(config)), null, 2))
-        .pipe(Effect.orDie)
+      const merged = mergeDeep(writable(existing), writable(config)) as Info
+      runtimeOverrides = mergeDeep(writable(runtimeOverrides), writable(config)) as Info
+      yield* fs.writeFileString(file, JSON.stringify(merged, null, 2)).pipe(Effect.orDie)
     })
 
     const invalidate = Effect.fn("Config.invalidate")(function* () {
+      runtimeOverrides = {}
       yield* invalidateGlobal
     })
 

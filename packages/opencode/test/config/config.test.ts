@@ -25,6 +25,7 @@ import {
   withTestInstance,
   provideInstanceEffect,
   testInstanceStoreLayer,
+  disposeAllInstancesEffect,
 } from "../fixture/fixture"
 import { InstanceRuntime } from "@/project/instance-runtime"
 import { CrossSpawnSpawner } from "@opencode-ai/core/cross-spawn-spawner"
@@ -899,6 +900,146 @@ it.instance("updates config and writes to file", () =>
 
     const writtenConfig = yield* FSUtil.use.readJson(path.join(test.directory, "config.json"))
     expect(writtenConfig).toMatchObject({ model: "updated/model" })
+  }),
+)
+
+it.instance("loads project config.json written by update after dispose", () =>
+  Effect.gen(function* () {
+    const test = yield* TestInstance
+    yield* Config.Service.use((svc) =>
+      svc.update(
+        ConfigParse.schema(
+          ConfigV1.Info,
+          {
+            model: "probe/from-config-json",
+            provider: {
+              "munk-local-ai": {
+                npm: "@ai-sdk/openai-compatible",
+                name: "Munk Local AI",
+                models: {
+                  "probe-model": { name: "probe-model" },
+                },
+              },
+            },
+          },
+          "test:config",
+        ),
+      ),
+    )
+
+    yield* disposeAllInstancesEffect
+
+    const config = yield* Config.use.get()
+    expect(config.model).toBe("probe/from-config-json")
+    expect(config.provider?.["munk-local-ai"]?.models?.["probe-model"]).toMatchObject({ name: "probe-model" })
+  }),
+)
+
+it.instance("runtimeOverrides outrank OPENCODE_CONFIG_CONTENT after update", () =>
+  withProcessEnv(
+    "OPENCODE_CONFIG_CONTENT",
+    JSON.stringify({
+      $schema: "https://opencode.ai/config.json",
+      model: "content/original",
+      provider: {
+        "munk-local-ai": {
+          npm: "@ai-sdk/openai-compatible",
+          name: "Munk Local AI",
+          models: {
+            original: { name: "original" },
+          },
+        },
+      },
+    }),
+    Effect.gen(function* () {
+      const before = yield* Config.use.get()
+      expect(before.model).toBe("content/original")
+
+      yield* Config.Service.use((svc) =>
+        svc.update(
+          ConfigParse.schema(
+            ConfigV1.Info,
+            {
+              model: "content/patched",
+              provider: {
+                "munk-local-ai": {
+                  npm: "@ai-sdk/openai-compatible",
+                  name: "Munk Local AI",
+                  models: {
+                    patched: { name: "patched" },
+                  },
+                },
+              },
+            },
+            "test:config",
+          ),
+        ),
+      )
+
+      yield* disposeAllInstancesEffect
+
+      const after = yield* Config.use.get()
+      expect(after.model).toBe("content/patched")
+      expect(after.provider?.["munk-local-ai"]?.models?.patched).toMatchObject({ name: "patched" })
+    }),
+  ),
+)
+
+it.effect("OPENCODE_CONFIG_DIR opencode.json models are visible and survive dispose", () =>
+  Effect.gen(function* () {
+    const configDir = yield* tmpdirScoped()
+    yield* FSUtil.use.writeWithDirs(
+      path.join(configDir, "opencode.json"),
+      JSON.stringify({
+        $schema: "https://opencode.ai/config.json",
+        model: "munk-local-ai/dir-model",
+        provider: {
+          "munk-local-ai": {
+            npm: "@ai-sdk/openai-compatible",
+            name: "Munk Local AI",
+            models: {
+              "dir-model": { name: "dir-model" },
+              "hot-model": { name: "hot-model" },
+            },
+          },
+        },
+      }),
+    )
+
+    const dir = yield* tmpdirScoped()
+    yield* withProcessEnv(
+      "OPENCODE_CONFIG_DIR",
+      configDir,
+      Effect.gen(function* () {
+        const first = yield* Config.use.get().pipe(provideInstanceEffect(dir))
+        expect(first.model).toBe("munk-local-ai/dir-model")
+        expect(first.provider?.["munk-local-ai"]?.models?.["hot-model"]).toMatchObject({ name: "hot-model" })
+
+        yield* FSUtil.use.writeWithDirs(
+          path.join(configDir, "opencode.json"),
+          JSON.stringify({
+            $schema: "https://opencode.ai/config.json",
+            model: "munk-local-ai/hot-model",
+            provider: {
+              "munk-local-ai": {
+                npm: "@ai-sdk/openai-compatible",
+                name: "Munk Local AI",
+                models: {
+                  "hot-model": { name: "hot-model" },
+                  "newer-model": { name: "newer-model" },
+                },
+              },
+            },
+          }),
+        )
+
+        yield* disposeAllInstancesEffect
+
+        const second = yield* Config.use.get().pipe(provideInstanceEffect(dir))
+        expect(second.model).toBe("munk-local-ai/hot-model")
+        expect(second.provider?.["munk-local-ai"]?.models?.["newer-model"]).toMatchObject({ name: "newer-model" })
+      }).pipe(Effect.provide(testInstanceStoreLayer), Effect.provide(LayerNode.compile(CrossSpawnSpawner.node))),
+    )
   }),
 )
 

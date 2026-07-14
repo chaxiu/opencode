@@ -23,6 +23,8 @@ const skipInstall = process.argv.includes("--skip-install")
 const sourcemapsFlag = process.argv.includes("--sourcemaps")
 const plugin = createSolidTransformPlugin()
 const skipEmbedWebUi = process.argv.includes("--skip-embed-web-ui")
+const osFlagIndex = process.argv.indexOf("--os")
+const osFilter = osFlagIndex >= 0 ? process.argv[osFlagIndex + 1] : undefined
 
 const createEmbeddedWebUIBundle = async () => {
   console.log(`Building Web UI to embed in the binary`)
@@ -113,26 +115,32 @@ const allTargets: {
   },
 ]
 
-const targets = singleFlag
-  ? allTargets.filter((item) => {
-      if (item.os !== process.platform || item.arch !== process.arch) {
-        return false
-      }
+const targets = allTargets.filter((item) => {
+  if (osFilter && item.os !== osFilter) {
+    return false
+  }
 
-      // When building for the current platform, prefer a single native binary by default.
-      // Baseline binaries require additional Bun artifacts and can be flaky to download.
-      if (item.avx2 === false) {
-        return baselineFlag
-      }
+  if (!singleFlag) {
+    return true
+  }
 
-      // also skip abi-specific builds for the same reason
-      if (item.abi !== undefined) {
-        return false
-      }
+  if (item.os !== process.platform || item.arch !== process.arch) {
+    return false
+  }
 
-      return true
-    })
-  : allTargets
+  // When building for the current platform, prefer a single native binary by default.
+  // Baseline binaries require additional Bun artifacts and can be flaky to download.
+  if (item.avx2 === false) {
+    return baselineFlag
+  }
+
+  // also skip abi-specific builds for the same reason
+  if (item.abi !== undefined) {
+    return false
+  }
+
+  return true
+})
 
 await $`rm -rf dist`
 

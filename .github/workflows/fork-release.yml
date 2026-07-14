@@ -94,26 +94,18 @@ jobs:
       fail-fast: false
       matrix:
         include:
-          - name: macos-arm64
+          - name: macos
             os: macos-14
-            build_args: --single
-            dist_name: opencode-darwin-arm64
-            archive_name: opencode-darwin-arm64.zip
-          - name: macos-x64
-            os: macos-13
-            build_args: --single --baseline
-            dist_name: opencode-darwin-x64-baseline
-            archive_name: opencode-darwin-x64-baseline.zip
-          - name: linux-x64
+            target_os: darwin
+            archive_glob: packages/opencode/dist/opencode-darwin-*.zip
+          - name: linux
             os: ubuntu-24.04
-            build_args: --single --baseline
-            dist_name: opencode-linux-x64-baseline
-            archive_name: opencode-linux-x64-baseline.tar.gz
-          - name: windows-x64
+            target_os: linux
+            archive_glob: packages/opencode/dist/opencode-linux-*.tar.gz
+          - name: windows
             os: windows-latest
-            build_args: --single --baseline
-            dist_name: opencode-windows-x64-baseline
-            archive_name: opencode-windows-x64-baseline.zip
+            target_os: win32
+            archive_glob: packages/opencode/dist/opencode-windows-*.zip
     runs-on: ${{ matrix.os }}
     steps:
       - uses: actions/checkout@v4
@@ -126,33 +118,48 @@ jobs:
         working-directory: packages/opencode
         env:
           OPENCODE_VERSION: ${{ needs.prepare-release.outputs.version }}
-        run: ./script/build.ts ${{ matrix.build_args }}
+        run: ./script/build.ts --os ${{ matrix.target_os }}
+
+      - name: Ad-hoc sign macOS CLI binaries
+        if: runner.os == 'macOS'
+        working-directory: packages/opencode
+        shell: bash
+        run: |
+          for bin in dist/opencode-darwin-*/bin/opencode; do
+            codesign --force --sign - "$bin"
+          done
 
       - name: Archive CLI binaries (Unix)
         if: runner.os != 'Windows'
         working-directory: packages/opencode
         shell: bash
         run: |
-          if [[ "${{ matrix.archive_name }}" == *.tar.gz ]]; then
-            tar -C "dist/${{ matrix.dist_name }}/bin" -czf "dist/${{ matrix.archive_name }}" .
-          else
-            (
-              cd "dist/${{ matrix.dist_name }}/bin"
-              zip -qr "../../${{ matrix.archive_name }}" .
-            )
-          fi
+          for dir in dist/opencode-${{ matrix.target_os == 'darwin' && 'darwin' || 'linux' }}-*; do
+            [ -d "${dir}/bin" ] || continue
+            name="$(basename "${dir}")"
+            if [[ "${name}" == opencode-linux-* ]]; then
+              tar -C "${dir}/bin" -czf "dist/${name}.tar.gz" .
+            else
+              (
+                cd "${dir}/bin"
+                zip -qr "../../${name}.zip" .
+              )
+            fi
+          done
 
       - name: Archive CLI binaries (Windows)
         if: runner.os == 'Windows'
         working-directory: packages/opencode
         shell: pwsh
         run: |
-          Compress-Archive -Path "dist/${{ matrix.dist_name }}/bin/*" -DestinationPath "dist/${{ matrix.archive_name }}" -Force
+          Get-ChildItem "dist" -Directory | Where-Object { $_.Name -like "opencode-windows-*" } | ForEach-Object {
+            Compress-Archive -Path "$($_.FullName)\bin\*" -DestinationPath "dist\$($_.Name).zip" -Force
+          }
 
       - uses: actions/upload-artifact@v4
         with:
           name: cli-release-assets-${{ matrix.name }}
-          path: packages/opencode/dist/${{ matrix.archive_name }}
+          path: ${{ matrix.archive_glob }}
           if-no-files-found: error
 
   publish-assets:
