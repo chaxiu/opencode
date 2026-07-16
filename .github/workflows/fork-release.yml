@@ -74,7 +74,8 @@ jobs:
           Included artifacts:
           - CLI binaries for macOS, Linux, and Windows
 
-          All assets in this release are unsigned.
+          Built on Linux with Bun cross-compile (same approach as upstream publish.yml).
+          All assets in this release are unsigned (no Developer ID / Azure Trusted Signing).
           EOF
 
           if gh release view "${tag}" >/dev/null 2>&1; then
@@ -88,25 +89,11 @@ jobs:
               --verify-tag
           fi
 
+  # Align with upstream anomalyco/opencode publish.yml build-cli:
+  # one Ubuntu job cross-compiles darwin + linux + windows CLI binaries.
   build-cli:
     needs: prepare-release
-    strategy:
-      fail-fast: false
-      matrix:
-        include:
-          - name: macos
-            os: macos-14
-            target_os: darwin
-            archive_glob: packages/opencode/dist/opencode-darwin-*.zip
-          - name: linux
-            os: ubuntu-24.04
-            target_os: linux
-            archive_glob: packages/opencode/dist/opencode-linux-*.tar.gz
-          - name: windows
-            os: windows-latest
-            target_os: win32
-            archive_glob: packages/opencode/dist/opencode-windows-*.zip
-    runs-on: ${{ matrix.os }}
+    runs-on: ubuntu-24.04
     steps:
       - uses: actions/checkout@v4
         with:
@@ -114,71 +101,64 @@ jobs:
 
       - uses: ./.github/actions/setup-bun
 
-      - name: Build CLI binaries
+      - name: Install zip
+        run: sudo apt-get update && sudo apt-get install -y zip
+
+      - name: Build CLI binaries (all platforms)
         working-directory: packages/opencode
         env:
           OPENCODE_VERSION: ${{ needs.prepare-release.outputs.version }}
-        run: ./script/build.ts --os ${{ matrix.target_os }}
+        run: ./script/build.ts
 
-      - name: Ad-hoc sign macOS CLI binaries
-        if: runner.os == 'macOS'
+      - name: Archive CLI binaries
         working-directory: packages/opencode
         shell: bash
         run: |
-          for bin in dist/opencode-darwin-*/bin/opencode; do
-            codesign --force --sign - "$bin"
-          done
+          set -euo pipefail
+          shopt -s nullglob
 
-      - name: Archive CLI binaries (Unix)
-        if: runner.os != 'Windows'
-        working-directory: packages/opencode
-        shell: bash
-        run: |
-          for dir in dist/opencode-${{ matrix.target_os == 'darwin' && 'darwin' || 'linux' }}-*; do
+          for dir in dist/opencode-linux-*; do
             [ -d "${dir}/bin" ] || continue
             name="$(basename "${dir}")"
-            if [[ "${name}" == opencode-linux-* ]]; then
-              tar -C "${dir}/bin" -czf "dist/${name}.tar.gz" .
-            else
-              (
-                cd "${dir}/bin"
-                zip -qr "../../${name}.zip" .
-              )
-            fi
+            tar -C "${dir}/bin" -czf "dist/${name}.tar.gz" .
+            echo "archived ${name}.tar.gz"
           done
 
-      - name: Archive CLI binaries (Windows)
-        if: runner.os == 'Windows'
-        working-directory: packages/opencode
-        shell: pwsh
-        run: |
-          Get-ChildItem "dist" -Directory | Where-Object { $_.Name -like "opencode-windows-*" } | ForEach-Object {
-            Compress-Archive -Path "$($_.FullName)\bin\*" -DestinationPath "dist\$($_.Name).zip" -Force
+          for dir in dist/opencode-darwin-* dist/opencode-windows-*; do
+            [ -d "${dir}/bin" ] || continue
+            name="$(basename "${dir}")"
+            (
+              cd "${dir}/bin"
+              zip -qr "../../${name}.zip" .
+            )
+            echo "archived ${name}.zip"
+          done
+
+          echo "--- archives ---"
+          ls -la dist/*.{zip,tar.gz} 2>/dev/null || {
+            echo "No archives produced under dist/"
+            exit 1
           }
 
       - uses: actions/upload-artifact@v4
         with:
-          name: cli-release-assets-${{ matrix.name }}
-          path: ${{ matrix.archive_glob }}
+          name: cli-release-assets
+          path: |
+            packages/opencode/dist/opencode-darwin-*.zip
+            packages/opencode/dist/opencode-linux-*.tar.gz
+            packages/opencode/dist/opencode-windows-*.zip
           if-no-files-found: error
 
   publish-assets:
     needs:
       - prepare-release
       - build-cli
-    if: >-
-      ${{
-        always() &&
-        needs.prepare-release.result == 'success' &&
-        needs.build_cli.result == 'success'
-      }}
     runs-on: ubuntu-latest
     steps:
       - uses: actions/download-artifact@v4
         with:
-          pattern: cli-release-assets-*
+          name: cli-release-assets
           path: release-assets
-          merge-multiple: true
 
       - name: Upload assets to GitHub release
         env:
@@ -189,6 +169,9 @@ jobs:
           files=(release-assets/*)
           if (( ${#files[@]} == 0 )); then
             echo "No release assets found"
+            ls -laR release-assets || true
             exit 1
           fi
-          gh release upload "${{ needs.prepare-release.outputs.tag }}" "${files[@]}" --clobber
+          echo "Uploading ${#files[@]} file(s) to ${{ needs.prepare-release.outputs.tag }}:"
+          printf ' - %s\n' "${files[@]}"
+          gh release upload "${{ needs.prepare-release.outputs.tag }}" "${files[@]}" --clobber --repo "${{ github.repository }}"
